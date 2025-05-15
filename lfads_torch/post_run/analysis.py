@@ -16,6 +16,7 @@ from scipy.special import gammaln
 from ..datamodules import reshuffle_train_valid
 from ..tuples import SessionOutput
 from ..utils import send_batch_to_device, transpose_lists
+import tools.dataset_tools as ds_tools
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,13 @@ def run_evaluation(model, datamodule, filename):
     dhps = datamodule.hparams
     data_paths = sorted(glob(dhps.datafile_pattern))
     filename = Path(filename)
-    ALIGN_RANGE = (-100, 700)
+    MONKEY = data_paths[0].split('/')[7]
+    TASK = data_paths[0].split('/')[8]
+    SESSION = int(data_paths[0].split('/')[9])
+    dataset_params = ds_tools.get_dataset_params(MONKEY, TASK, SESSION)
+    ALIGN_RANGE = dataset_params['align_range']
+    NUM_CONDS = dataset_params['num_conds']
+    KIN_FIELD = dataset_params['decoding_field']
     
     for path in data_paths:
         data_path = Path(path)
@@ -268,16 +275,19 @@ def run_evaluation(model, datamodule, filename):
         for i in range(len(heldout_idx)):
             R2_heldout[i] = sklearn.metrics.r2_score(spikes_mean_heldout[i,:,:].swapaxes(0,1).flatten(), rates_mean_heldout[i,:,:].swapaxes(0,1).flatten())
 
-        SESSION = ds.fpath.split('/')[-1].split('.')[0]
-        # get the SNR array
-        with open(f'/snel/share/data/neuralink/snr/pager/snr_{SESSION}.pkl', 'rb') as f:
-            snr_array = pickle.load(f)
-        channels = ds.data.spikes.columns.values
-        snr_array['snr'] = snr_array['snr'][channels.astype(np.int32)]
-        snr_heldin = snr_array['snr'][heldin_idx]
-        snr_heldout = snr_array['snr'][heldout_idx]
-        psth_r2_heldin = R2_heldin[np.where(snr_heldin > 0)[0]].mean()
-        psth_r2_heldout = R2_heldout[np.where(snr_heldout > 0)[0]].mean()
+        # # get the SNR array
+        # if 'indy' in data_paths[0]:
+        #     with open(f'/snel/share/data/neuralink/snr/indy/snr_{SESSION}.pkl', 'rb') as f:
+        #         snr_array = pickle.load(f)
+        # elif 'pager' in data_paths[0]:
+        #     with open(f'/snel/share/data/neuralink/snr/pager/snr_{SESSION}.pkl', 'rb') as f:
+        #         snr_array = pickle.load(f)
+        # channels = ds.data.spikes.columns.values
+        # snr_array['snr'] = snr_array['snr'][channels.astype(np.int32)]
+        # snr_heldin = snr_array['snr'][heldin_idx]
+        # snr_heldout = snr_array['snr'][heldout_idx]
+        # psth_r2_heldin = R2_heldin[np.where(snr_heldin > 0)[0]].mean()
+        # psth_r2_heldout = R2_heldout[np.where(snr_heldout > 0)[0]].mean()
 
         # mean_fr_heldin = np.nanmean(spikes_mean_heldin, axis=(1,2)) / 0.015
         # mean_fr_heldout = np.nanmean(spikes_mean_heldout, axis=(1,2)) / 0.015
@@ -285,7 +295,7 @@ def run_evaluation(model, datamodule, filename):
         # psth_r2_heldout = R2_heldout[np.where(mean_fr_heldout > 1)[0]].mean()
 
         num_trials = len(np.unique(ds.trials.trial_id.values))
-        trials_with_nans = np.unique(ds.trials.trial_id.loc[np.isnan(ds.trials['joystick_position'].values)].values)
+        trials_with_nans = np.unique(ds.trials.trial_id.loc[np.isnan(ds.trials[KIN_FIELD].values)].values)
         if len(trials_with_nans)/num_trials > 0.33: 
             print(f'Skipping this dataset - {len(trials_with_nans)} contain NaNs.')
             behavior_r2 = np.nan
@@ -297,18 +307,18 @@ def run_evaluation(model, datamodule, filename):
                     dec.prepare_decoding_data(
                         ds.trials,
                         'lfads_factors',
-                        'joystick_position',
+                        KIN_FIELD,
                         valid_ratio=0.2,
                         ms_lag=0,
                         n_history=0,
-                        # channels = heldin_channels,
+                        # channels = heldin_idx,
                         return_groups=True,
                     )
 
             decoder = dec.NeuralDecoder(        
                     {
                         'estimator': sklearn.linear_model.Ridge(), 
-                        'param_grid': {'alpha': np.logspace(2, 3, 10)},
+                        'param_grid': {'alpha': np.logspace(-4, 3, 10)},
                         'cv': 5,
                     }
                 )
@@ -316,15 +326,34 @@ def run_evaluation(model, datamodule, filename):
             decoder.fit(x_train, y_train)
             behavior_r2 = decoder.score(x_valid, y_valid, multioutput='variance_weighted')
 
+        # save the processed dataset
+        with open("processed_ds.pkl", 'wb') as f:
+            pickle.dump(ds, f)
+
         metrics = {
             'heldin_channels': len(heldin_idx),
             'heldout_channels': len(heldout_idx),
             'behavior_r2': behavior_r2,
             'post_co_bps': bps,
-            'psth_r2_heldin': psth_r2_heldin,
-            'psth_r2_heldout': psth_r2_heldout,
+            # 'psth_r2_heldin': psth_r2_heldin,
+            # 'psth_r2_heldout': psth_r2_heldout,
             'R2_heldin': R2_heldin.tolist(),
             'R2_heldout': R2_heldout.tolist(),
+            'kl_ic_scale': model.hparams.kl_ic_scale,
+            'kl_co_scale': model.hparams.kl_co_scale,
+            'l2_con_scale': model.hparams.l2_con_scale,
+            'l2_gen_scale': model.hparams.l2_gen_scale,
+            'dropout_rate': model.hparams.dropout_rate,
+            # 'cd_rate': model.hparams.train_aug_stack.batch_transforms[0].cd_rate,
+            'lr_init': model.hparams.lr_init,
+            'batch_size': dhps.batch_size,
+            'ic_enc_dim': model.hparams.ic_enc_dim,
+            'ci_enc_dim': model.hparams.ci_enc_dim,
+            'con_dim': model.hparams.con_dim,
+            'co_dim': model.hparams.co_dim,
+            'ic_dim': model.hparams.ic_dim,
+            'gen_dim': model.hparams.gen_dim,
+            'fac_dim': model.hparams.fac_dim,
             # 'mean_fr_heldin': mean_fr_heldin.tolist(),
             # 'mean_fr_heldout': mean_fr_heldout.tolist(),
         }
